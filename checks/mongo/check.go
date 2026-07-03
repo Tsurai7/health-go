@@ -17,12 +17,16 @@ const (
 	defaultTimeoutPing       = 5 * time.Second
 )
 
-var errNilClient = errors.New("mongoDB health check failed on ping: nil mongo client")
-
 // Config is the MongoDB checker configuration settings container.
 type Config struct {
-	// DSN is the MongoDB instance connection DSN. Required.
+	// DSN is the MongoDB instance connection DSN. Optional if Client is supplied.
 	DSN string
+
+	// Client is an existing mongo client and can be used in place of DSN. Recommended,
+	// since it reuses the application's connection pool instead of establishing and
+	// tearing down a new connection on every check. The caller is responsible for
+	// managing the client's lifecycle. Optional if DSN is supplied.
+	Client *mongo.Client
 
 	// TimeoutConnect defines timeout for establishing mongo connection, if not set - default value is used
 	TimeoutConnect time.Duration
@@ -32,38 +36,9 @@ type Config struct {
 	TimeoutPing time.Duration
 }
 
-// NewPingCheck creates a MongoDB health check using an existing client.
-// The caller is responsible for managing the client's lifecycle.
-func NewPingCheck(client *mongo.Client, timeout time.Duration) func(ctx context.Context) error {
-	if client == nil {
-		return func(context.Context) error {
-			return errNilClient
-		}
-	}
-
-	if timeout == 0 {
-		timeout = defaultTimeoutPing
-	}
-
-	return func(ctx context.Context) error {
-		ctxPing, cancelPing := context.WithTimeout(ctx, timeout)
-		defer cancelPing()
-
-		err := client.Ping(ctxPing, readpref.Primary())
-		if err != nil {
-			return fmt.Errorf("mongoDB health check failed on ping: %w", err)
-		}
-
-		return nil
-	}
-}
-
 // New creates new MongoDB health check that verifies the following:
-// - connection establishing
+// - connection establishing (skipped when an existing Client is supplied)
 // - doing the ping command
-//
-// Deprecated: use NewPingCheck instead. It uses an existing *mongo.Client
-// to avoid connection churn.
 func New(config Config) func(ctx context.Context) error {
 	if config.TimeoutConnect == 0 {
 		config.TimeoutConnect = defaultTimeoutConnect
@@ -78,28 +53,16 @@ func New(config Config) func(ctx context.Context) error {
 	}
 
 	return func(ctx context.Context) (checkErr error) {
-		client, err := mongo.NewClient(options.Client().ApplyURI(config.DSN))
+		shutdown, client, err := initClient(ctx, config)
 		if err != nil {
-			checkErr = fmt.Errorf("mongoDB health check failed on client creation: %w", err)
-			return
-		}
-
-		ctxConn, cancelConn := context.WithTimeout(ctx, config.TimeoutConnect)
-		defer cancelConn()
-
-		err = client.Connect(ctxConn)
-		if err != nil {
-			checkErr = fmt.Errorf("mongoDB health check failed on connect: %w", err)
+			checkErr = err
 			return
 		}
 
 		defer func() {
-			ctxDisc, cancelDisc := context.WithTimeout(ctx, config.TimeoutDisconnect)
-			defer cancelDisc()
-
 			// override checkErr only if there were no other errors
-			if err := client.Disconnect(ctxDisc); err != nil && checkErr == nil {
-				checkErr = fmt.Errorf("mongoDB health check failed on closing connection: %w", err)
+			if err := shutdown(ctx); err != nil && checkErr == nil {
+				checkErr = err
 			}
 		}()
 
@@ -114,4 +77,40 @@ func New(config Config) func(ctx context.Context) error {
 
 		return
 	}
+}
+
+func initClient(ctx context.Context, c Config) (func(ctx context.Context) error, *mongo.Client, error) {
+	if c.Client != nil {
+		return func(context.Context) error { return nil }, c.Client, nil
+	}
+
+	if c.DSN == "" {
+		return nil, nil, errors.New("mongoDB DSN or an existing client is required to initialize mongoDB health check")
+	}
+
+	client, err := mongo.NewClient(options.Client().ApplyURI(c.DSN))
+	if err != nil {
+		return nil, nil, fmt.Errorf("mongoDB health check failed on client creation: %w", err)
+	}
+
+	ctxConn, cancelConn := context.WithTimeout(ctx, c.TimeoutConnect)
+	defer cancelConn()
+
+	err = client.Connect(ctxConn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mongoDB health check failed on connect: %w", err)
+	}
+
+	shutdown := func(ctx context.Context) error {
+		ctxDisc, cancelDisc := context.WithTimeout(ctx, c.TimeoutDisconnect)
+		defer cancelDisc()
+
+		if err := client.Disconnect(ctxDisc); err != nil {
+			return fmt.Errorf("mongoDB health check failed on closing connection: %w", err)
+		}
+
+		return nil
+	}
+
+	return shutdown, client, nil
 }
